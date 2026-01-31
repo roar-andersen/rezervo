@@ -1,7 +1,9 @@
+import datetime as dt
+import uuid
 from collections import defaultdict
-from datetime import datetime
 from typing import Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy import and_, delete, or_, select
@@ -101,11 +103,11 @@ def upsert_chain_user_creds(
             password=creds.password,
         )
         if mark_as_verified:
-            db_chain_user.auth_verified_at = datetime.now()
+            db_chain_user.auth_verified_at = dt.datetime.now()
         db.add(db_chain_user)
     else:
         if mark_as_verified:
-            db_chain_user.auth_verified_at = datetime.now()
+            db_chain_user.auth_verified_at = dt.datetime.now()
         if (
             db_chain_user.username == creds.username
             and db_chain_user.password == creds.password
@@ -154,7 +156,7 @@ def get_chain_user_totp(
 
 def get_chain_user_auth_verified_at(
     db: Session, chain_identifier: ChainIdentifier, user_id: UUID
-) -> Optional[datetime]:
+) -> Optional[dt.datetime]:
     return (
         db.query(models.ChainUser.auth_verified_at)
         .filter_by(user_id=user_id, chain=chain_identifier)
@@ -167,7 +169,7 @@ def update_chain_user_auth_verified_at(
 ):
     db.query(models.ChainUser).filter_by(
         user_id=user_id, chain=chain_identifier
-    ).update({models.ChainUser.auth_verified_at: datetime.now()})
+    ).update({models.ChainUser.auth_verified_at: dt.datetime.now()})
     db.commit()
 
 
@@ -189,23 +191,34 @@ def get_chain_user(
     return _get_chain_user_from_db_model(db, db_chain_user)
 
 
+def _class_from_db_booking(db_booking: models.RecurringBooking) -> Class:
+    return Class(
+        **db_booking.__dict__,
+        start_time=ClassTime(
+            hour=db_booking.start_time_hour,
+            minute=db_booking.start_time_minute,
+        ),
+    )
+
+
 def _get_chain_user_from_db_model(
     db: Session, db_chain_user: models.ChainUser
 ) -> ChainUser:
+    all_bookings = list(
+        db.query(models.RecurringBooking).filter_by(
+            user_id=db_chain_user.user_id,
+            chain_id=db_chain_user.chain,
+        )
+    )
     return ChainUser(
         **db_chain_user.__dict__,
         recurring_bookings=[
-            Class(
-                **db_booking.__dict__,
-                start_time=ClassTime(
-                    hour=db_booking.start_time_hour,
-                    minute=db_booking.start_time_minute,
-                ),
-            )
-            for db_booking in db.query(models.RecurringBooking).filter_by(
-                user_id=db_chain_user.user_id,
-                chain_id=db_chain_user.chain,
-            )
+            _class_from_db_booking(b) for b in all_bookings if b.specific_date is None
+        ],
+        one_time_bookings=[
+            _class_from_db_booking(b)
+            for b in all_bookings
+            if b.specific_date is not None
         ],
     )
 
@@ -243,6 +256,42 @@ def get_chain_user_profile(
     )
 
 
+def _upsert_bookings(
+    db: Session,
+    user_id: UUID,
+    chain_id: str,
+    bookings: list[Class],
+    is_one_time: bool,
+) -> list[uuid.UUID]:
+    """Upsert bookings and return IDs of kept (existing) bookings."""
+    kept_ids: list[uuid.UUID] = []
+    for c in bookings:
+        filter_kwargs = {
+            "user_id": user_id,
+            "chain_id": chain_id,
+            "activity_id": c.activity_id,
+            "weekday": c.weekday,
+            "location_id": c.location_id,
+            "start_time_hour": c.start_time.hour,
+            "start_time_minute": c.start_time.minute,
+            "specific_date": c.specific_date if is_one_time else None,
+        }
+        db_booking = (
+            db.query(models.RecurringBooking).filter_by(**filter_kwargs).one_or_none()
+        )
+        if db_booking is None:
+            db.add(
+                models.RecurringBooking(
+                    **filter_kwargs,
+                    display_name=c.display_name,
+                )
+            )
+        else:
+            db_booking.display_name = c.display_name
+            kept_ids.append(db_booking.id)
+    return kept_ids
+
+
 def update_chain_config(
     db: Session, user_id: UUID, config: ChainConfig
 ) -> Optional[ChainConfig]:
@@ -254,47 +303,138 @@ def update_chain_config(
     if db_chain_user is None:
         return None
     db_chain_user.active = config.active
-    # keep track of which existing bookings are kept in the new config
-    # (the rest will be deleted, and any new ones will be added)
-    kept_recurring_booking_ids = []
-    for c in config.recurring_bookings:
-        db_booking = (
-            db.query(models.RecurringBooking)
-            .filter_by(
-                user_id=user_id,
-                chain_id=config.chain,
-                activity_id=c.activity_id,
-                weekday=c.weekday,
-                location_id=c.location_id,
-                start_time_hour=c.start_time.hour,
-                start_time_minute=c.start_time.minute,
-            )
-            .one_or_none()
+    kept_recurring = _upsert_bookings(
+        db, user_id, config.chain, config.recurring_bookings, is_one_time=False
+    )
+    # Preserve existing one-time bookings - they are managed via dedicated endpoints
+    existing_one_time_ids = [
+        b.id
+        for b in db.query(models.RecurringBooking).filter_by(
+            user_id=user_id,
+            chain_id=config.chain,
         )
-        if db_booking is None:
-            db.add(
-                models.RecurringBooking(
-                    user_id=user_id,
-                    chain_id=config.chain,
-                    activity_id=c.activity_id,
-                    weekday=c.weekday,
-                    location_id=c.location_id,
-                    start_time_hour=c.start_time.hour,
-                    start_time_minute=c.start_time.minute,
-                    display_name=c.display_name,
-                )
-            )
-        else:
-            db_booking.display_name = c.display_name
-            kept_recurring_booking_ids.append(db_booking.id)
-    # remove bookings not part of existing bookings for this user
+        if b.specific_date is not None
+    ]
+    kept_ids = kept_recurring + existing_one_time_ids
+    # Remove recurring bookings not part of existing bookings for this user
+    # (one-time bookings are preserved)
     db.query(models.RecurringBooking).filter_by(
         user_id=user_id,
         chain_id=config.chain,
-    ).filter(~models.RecurringBooking.id.in_(kept_recurring_booking_ids)).delete()
+    ).filter(
+        models.RecurringBooking.specific_date.is_(None),
+        ~models.RecurringBooking.id.in_(kept_ids),
+    ).delete()
     db.commit()
     db.refresh(db_chain_user)
     return config_from_chain_user(_get_chain_user_from_db_model(db, db_chain_user))
+
+
+def add_one_time_booking(
+    db: Session,
+    user_id: UUID,
+    chain_identifier: ChainIdentifier,
+    class_config: Class,
+) -> Optional[ChainConfig]:
+    db_chain_user = get_db_chain_user(db, chain_identifier, user_id)
+    if db_chain_user is None:
+        return None
+    if class_config.specific_date is None:
+        return None
+    existing = (
+        db.query(models.RecurringBooking)
+        .filter_by(
+            user_id=user_id,
+            chain_id=chain_identifier,
+            activity_id=class_config.activity_id,
+            weekday=class_config.weekday,
+            location_id=class_config.location_id,
+            start_time_hour=class_config.start_time.hour,
+            start_time_minute=class_config.start_time.minute,
+            specific_date=class_config.specific_date,
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        return config_from_chain_user(_get_chain_user_from_db_model(db, db_chain_user))
+    db.add(
+        models.RecurringBooking(
+            user_id=user_id,
+            chain_id=chain_identifier,
+            activity_id=class_config.activity_id,
+            weekday=class_config.weekday,
+            location_id=class_config.location_id,
+            start_time_hour=class_config.start_time.hour,
+            start_time_minute=class_config.start_time.minute,
+            display_name=class_config.display_name,
+            specific_date=class_config.specific_date,
+        )
+    )
+    db.commit()
+    db.refresh(db_chain_user)
+    return config_from_chain_user(_get_chain_user_from_db_model(db, db_chain_user))
+
+
+def remove_one_time_booking(
+    db: Session,
+    user_id: UUID,
+    chain_identifier: ChainIdentifier,
+    class_config: Class,
+) -> Optional[ChainConfig]:
+    db_chain_user = get_db_chain_user(db, chain_identifier, user_id)
+    if db_chain_user is None:
+        return None
+    if class_config.specific_date is None:
+        return None
+    db.query(models.RecurringBooking).filter_by(
+        user_id=user_id,
+        chain_id=chain_identifier,
+        activity_id=class_config.activity_id,
+        weekday=class_config.weekday,
+        location_id=class_config.location_id,
+        start_time_hour=class_config.start_time.hour,
+        start_time_minute=class_config.start_time.minute,
+        specific_date=class_config.specific_date,
+    ).delete()
+    db.commit()
+    db.refresh(db_chain_user)
+    return config_from_chain_user(_get_chain_user_from_db_model(db, db_chain_user))
+
+
+def purge_expired_one_time_bookings(db: Session) -> int:
+    # Use Oslo timezone for Norwegian gym chains
+    oslo_tz = ZoneInfo("Europe/Oslo")
+    today = dt.datetime.now(oslo_tz).date()
+    row_count = (
+        db.query(models.RecurringBooking)
+        .filter(
+            models.RecurringBooking.specific_date.isnot(None),
+            models.RecurringBooking.specific_date < today,
+        )
+        .delete()
+    )
+    db.commit()
+    return row_count
+
+
+def delete_one_time_booking_by_id(
+    db: Session,
+    user_id: UUID,
+    chain_identifier: ChainIdentifier,
+    booking_id: uuid.UUID,
+) -> bool:
+    row_count = (
+        db.query(models.RecurringBooking)
+        .filter_by(
+            id=booking_id,
+            user_id=user_id,
+            chain_id=chain_identifier,
+        )
+        .filter(models.RecurringBooking.specific_date.isnot(None))
+        .delete()
+    )
+    db.commit()
+    return row_count > 0
 
 
 def delete_user(db: Session, user_id: UUID):
@@ -358,7 +498,7 @@ def update_last_used_push_notification_subscription(
     )
     if db_subscription is None:
         return
-    db_subscription.last_used = datetime.now()
+    db_subscription.last_used = dt.datetime.now()
     db.commit()
 
 
@@ -442,7 +582,7 @@ def verify_push_notification_subscription(
 def purge_slack_receipts(db) -> int:
     row_count = (
         db.query(models.SlackClassNotificationReceipt)
-        .filter(models.SlackClassNotificationReceipt.expires_at < datetime.now())
+        .filter(models.SlackClassNotificationReceipt.expires_at < dt.datetime.now())
         .delete()
     )
     db.commit()

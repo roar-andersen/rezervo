@@ -17,6 +17,7 @@ from rezervo.schemas.schedule import (
 )
 from rezervo.utils.config_utils import (
     class_config_recurrent_id,
+    rezervo_class_one_time_id,
     rezervo_class_recurrent_id,
 )
 from rezervo.utils.logging_utils import log
@@ -131,7 +132,7 @@ async def remove_session(
 async def remove_sessions(
     chain_identifier: ChainIdentifier,
     user_id: UUID,
-    recurrent_ids_to_remove: list[str],
+    class_ids_to_remove: set[str],
     session_state: SessionState,
 ):
     with SessionLocal() as db:
@@ -145,12 +146,27 @@ async def remove_sessions(
             .all()
         )
         for session in user_planned_sessions:
-            if (
-                rezervo_class_recurrent_id(UserSession.from_orm(session).class_data)
-                in recurrent_ids_to_remove
-            ):
+            class_data = UserSession.from_orm(session).class_data
+            recurrent_id = rezervo_class_recurrent_id(class_data)
+            one_time_id = rezervo_class_one_time_id(
+                class_data, class_data.start_time.date()
+            )
+            if recurrent_id in class_ids_to_remove or one_time_id in class_ids_to_remove:
                 db.delete(session)
         db.commit()
+
+
+def _all_booking_ids(config: ChainConfig | None) -> set[str]:
+    if config is None or not config.active:
+        return set()
+    return {
+        class_config_recurrent_id(_class)
+        for _class in list(config.recurring_bookings) + list(config.one_time_bookings)
+    }
+
+
+def _all_bookings(config: ChainConfig) -> list:
+    return list(config.recurring_bookings) + list(config.one_time_bookings)
 
 
 async def update_planned_sessions(
@@ -159,33 +175,19 @@ async def update_planned_sessions(
     previous_config: ChainConfig | None,
     updated_config: ChainConfig,
 ):
-    previous_class_ids = (
-        set()
-        if previous_config is None or not previous_config.active
-        else {
-            class_config_recurrent_id(_class)
-            for _class in previous_config.recurring_bookings
-        }
-    )
-    updated_class_ids = (
-        set()
-        if not updated_config.active
-        else {
-            class_config_recurrent_id(_class)
-            for _class in updated_config.recurring_bookings
-        }
-    )
+    previous_class_ids = _all_booking_ids(previous_config)
+    updated_class_ids = _all_booking_ids(updated_config)
 
     removed_class_ids = previous_class_ids - updated_class_ids
     added_class_ids = updated_class_ids - previous_class_ids
 
     if len(removed_class_ids) > 0:
         await remove_sessions(
-            chain_identifier, user_id, list(removed_class_ids), SessionState.PLANNED
+            chain_identifier, user_id, removed_class_ids, SessionState.PLANNED
         )
 
     find_session_class_tasks = []
-    for _class_config in updated_config.recurring_bookings:
+    for _class_config in _all_bookings(updated_config):
         if class_config_recurrent_id(_class_config) in added_class_ids:
             find_session_class_tasks.append(
                 get_chain(chain_identifier).find_class(_class_config)

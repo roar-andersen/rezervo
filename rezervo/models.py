@@ -1,14 +1,17 @@
+import datetime
 import enum
 import uuid
-from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
     CheckConstraint,
+    Date,
     Enum,
     ForeignKey,
+    Index,
     SmallInteger,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -63,7 +66,7 @@ class PushNotificationSubscription(Base):
     )
     endpoint: Mapped[str] = mapped_column(primary_key=True)
     keys: Mapped[dict] = mapped_column()
-    last_used: Mapped[Optional[datetime]] = mapped_column()
+    last_used: Mapped[Optional[datetime.datetime]] = mapped_column()
 
     def __repr__(self):
         return (
@@ -83,7 +86,7 @@ class ChainUser(Base):
     password: Mapped[Optional[str]] = mapped_column()
     totp: Mapped[Optional[str]] = mapped_column()
     auth_data: Mapped[Optional[str]] = mapped_column()
-    auth_verified_at: Mapped[Optional[datetime]] = mapped_column()
+    auth_verified_at: Mapped[Optional[datetime.datetime]] = mapped_column()
     active: Mapped[bool] = mapped_column(default=True)
 
     def __repr__(self):
@@ -121,8 +124,24 @@ class RecurringBooking(Base):
         ),
     )
     display_name: Mapped[Optional[str]] = mapped_column()
+    specific_date: Mapped[Optional[datetime.date]] = mapped_column(Date, nullable=True)
 
     __table_args__ = (
+        # Partial unique index for recurring bookings (specific_date IS NULL)
+        # This prevents duplicate recurring bookings since NULL != NULL in SQL
+        Index(
+            "unique_recurring_booking_idx",
+            "user_id",
+            "chain_id",
+            "location_id",
+            "activity_id",
+            "weekday",
+            "start_time_hour",
+            "start_time_minute",
+            unique=True,
+            postgresql_where=text("specific_date IS NULL"),
+        ),
+        # Unique constraint for one-time bookings (specific_date IS NOT NULL)
         UniqueConstraint(
             "user_id",
             "chain_id",
@@ -131,7 +150,8 @@ class RecurringBooking(Base):
             "weekday",
             "start_time_hour",
             "start_time_minute",
-            name="unique_recurring_booking",
+            "specific_date",
+            name="unique_one_time_booking",
         ),
     )
 
@@ -169,7 +189,7 @@ class SlackClassNotificationReceipt(Base):
     channel_id: Mapped[str] = mapped_column()
     message_id: Mapped[str] = mapped_column()
     scheduled_reminder_id: Mapped[Optional[str]] = mapped_column()
-    expires_at: Mapped[datetime] = mapped_column()
+    expires_at: Mapped[datetime.datetime] = mapped_column()
 
     def __repr__(self):
         return (
