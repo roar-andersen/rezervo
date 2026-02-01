@@ -81,10 +81,17 @@ async def book(
             )
         return
     _class_config = None
+    is_one_time = False
     for r in chain_user.recurring_bookings:
         if class_config_recurrent_id(r) == class_id:
             _class_config = r
             break
+    if _class_config is None:
+        for r in chain_user.one_time_bookings:
+            if class_config_recurrent_id(r) == class_id:
+                _class_config = r
+                is_one_time = True
+                break
     if _class_config is None:
         log.error(f"Recurring booking with id '{class_id}' not found")
         with aprs_ctx() as error_ctx:
@@ -238,6 +245,14 @@ async def book(
                 config.notifications, _class_config, booking_result, check_run
             )
         raise typer.Exit(1)
+    if (
+        is_one_time
+        and _class_config is not None
+        and _class_config.specific_date is not None
+    ):
+        log.debug("Removing completed one-time booking from config...")
+        with SessionLocal() as db:
+            crud.remove_one_time_booking(db, user_id, chain_identifier, _class_config)
     log.debug("Pulling sessions ...")
     await pull_sessions(chain_identifier, user_id)
 

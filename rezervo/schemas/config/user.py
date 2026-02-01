@@ -55,6 +55,7 @@ class Class(CamelModel):
     location_id: str
     start_time: ClassTime  # TODO: make sure time zones are handled...
     display_name: Optional[str] = None
+    specific_date: Optional[datetime.date] = None
 
     def calculate_next_occurrence(
         self, include_today: bool = True
@@ -62,6 +63,16 @@ class Class(CamelModel):
         now = datetime.datetime.now().astimezone(
             pytz.timezone("Europe/Oslo")
         )  # TODO: clean this
+        if self.specific_date is not None:
+            return now.replace(
+                year=self.specific_date.year,
+                month=self.specific_date.month,
+                day=self.specific_date.day,
+                hour=self.start_time.hour,
+                minute=self.start_time.minute,
+                second=0,
+                microsecond=0,
+            )
         days_ahead = self.weekday - now.weekday()
         if days_ahead < 0 or (
             days_ahead == 0
@@ -80,6 +91,7 @@ class Class(CamelModel):
 
 class RecurringBookings(CamelModel):
     recurring_bookings: list[Class]
+    one_time_bookings: list[Class] = []
 
 
 class BaseChainConfig(RecurringBookings, CamelModel):

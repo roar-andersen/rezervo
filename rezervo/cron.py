@@ -21,6 +21,13 @@ async def refresh_recurring_booking_cron_jobs(
     user_id: Optional[UUID] = None,
     chain_identifiers: list[ChainIdentifier] = ACTIVE_CHAIN_IDENTIFIERS,
 ):
+    # Clean up expired one-time bookings
+    with SessionLocal() as db:
+        purged = crud.purge_expired_one_time_bookings(db)
+        if purged > 0:
+            log.info(
+                f"Purged {purged} expired one-time booking{'s' if purged > 1 else ''}"
+            )
     chains = [get_chain(c) for c in chain_identifiers]
     recurring_booking_user_configs: list[tuple[Config, ChainConfig, models.User]] = []
     with SessionLocal() as db:

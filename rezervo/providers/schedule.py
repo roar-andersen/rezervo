@@ -15,11 +15,15 @@ def find_class_in_schedule_by_config(
     if not 0 <= _class_config.weekday < len(WEEKDAYS):
         log.error(f"Invalid weekday number ({_class_config.weekday=})")
         return BookingError.MALFORMED_SEARCH
-    weekday_str = WEEKDAYS[_class_config.weekday]
     result = None
     for day in schedule.days:
-        if day.day_name != weekday_str:
-            continue
+        if _class_config.specific_date is not None:
+            if day.date != _class_config.specific_date.isoformat():
+                continue
+        else:
+            weekday_str = WEEKDAYS[_class_config.weekday]
+            if day.day_name != weekday_str:
+                continue
         for c in day.classes:
             if c.location.id != _class_config.location_id:
                 continue

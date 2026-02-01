@@ -24,6 +24,7 @@ from rezervo.schemas.config.user import (
     ChainUserCredentials,
     ChainUserProfile,
     ChainUserTOTPPayload,
+    Class,
     InitiatedTOTPFlowResponse,
     PutChainUserCredsResponse,
     UpdatedChainUserCredsResponse,
@@ -209,6 +210,72 @@ async def put_chain_config(
     return updated_config
 
 
+@router.post("/{chain_identifier}/one-time-booking", response_model=BaseChainConfig)
+async def add_one_time_booking(
+    chain_identifier: ChainIdentifier,
+    class_config: Class,
+    background_tasks: BackgroundTasks,
+    token=Depends(token_auth_scheme),
+    db: Session = Depends(get_db),
+    app_config: AppConfig = Depends(read_app_config),
+):
+    db_user = crud.user_from_token(db, app_config, token)
+    if db_user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    if class_config.specific_date is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="specific_date is required for one-time bookings",
+        )
+    previous_config = crud.get_chain_config(db, chain_identifier, db_user.id)
+    updated_config = crud.add_one_time_booking(
+        db, db_user.id, chain_identifier, class_config
+    )
+    if updated_config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    await update_planned_sessions(
+        chain_identifier, db_user.id, previous_config, updated_config
+    )
+    background_tasks.add_task(pull_sessions, chain_identifier, db_user.id)
+    background_tasks.add_task(
+        refresh_recurring_booking_cron_jobs, db_user.id, [chain_identifier]
+    )
+    return updated_config
+
+
+@router.delete("/{chain_identifier}/one-time-booking", response_model=BaseChainConfig)
+async def remove_one_time_booking(
+    chain_identifier: ChainIdentifier,
+    class_config: Class,
+    background_tasks: BackgroundTasks,
+    token=Depends(token_auth_scheme),
+    db: Session = Depends(get_db),
+    app_config: AppConfig = Depends(read_app_config),
+):
+    db_user = crud.user_from_token(db, app_config, token)
+    if db_user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+    if class_config.specific_date is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="specific_date is required for one-time bookings",
+        )
+    previous_config = crud.get_chain_config(db, chain_identifier, db_user.id)
+    updated_config = crud.remove_one_time_booking(
+        db, db_user.id, chain_identifier, class_config
+    )
+    if updated_config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    await update_planned_sessions(
+        chain_identifier, db_user.id, previous_config, updated_config
+    )
+    background_tasks.add_task(pull_sessions, chain_identifier, db_user.id)
+    background_tasks.add_task(
+        refresh_recurring_booking_cron_jobs, db_user.id, [chain_identifier]
+    )
+    return updated_config
+
+
 @router.get(
     "/{chain_identifier}/all-configs",
     response_model=dict[str, list[UserIdAndNameWithIsSelf]],
@@ -235,7 +302,10 @@ def get_all_configs_index(
         dbu = crud.get_user(db, chain_user.user_id)
         if dbu is None:
             continue
-        for c in chain_user.recurring_bookings:
+        all_bookings = list(chain_user.recurring_bookings) + list(
+            chain_user.one_time_bookings
+        )
+        for c in all_bookings:
             class_id = class_config_recurrent_id(c)
             if class_id not in user_configs_dict:
                 user_configs_dict[class_id] = []

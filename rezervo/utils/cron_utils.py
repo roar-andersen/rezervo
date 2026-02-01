@@ -1,6 +1,6 @@
 import asyncio
+import datetime
 import re
-from datetime import datetime, timedelta
 from re import Pattern
 from uuid import UUID
 
@@ -40,13 +40,13 @@ async def build_cron_jobs_from_config(
 ) -> list[CronItem]:
     if not chain_config.active or chain_config.recurring_bookings is None:
         return []
+    all_bookings = list(chain_config.recurring_bookings) + list(
+        chain_config.one_time_bookings
+    )
     jobs = []
     reusable_jobs = existing_jobs.copy()
     for class_config, _class in await asyncio.gather(
-        *[
-            find_class_with_config_task(chain_config.chain, rb)
-            for rb in chain_config.recurring_bookings
-        ]
+        *[find_class_with_config_task(chain_config.chain, rb) for rb in all_bookings]
     ):
         if (
             _class is None
@@ -120,7 +120,7 @@ def build_booking_cron_job(
     user: models.User,
     chain_identifier: ChainIdentifier,
     class_config: Class,
-    booking_opens_at: datetime,
+    booking_opens_at: datetime.datetime,
     cron_config: Cron,
     precheck: bool = False,
 ) -> CronItem:
@@ -141,20 +141,32 @@ def build_booking_cron_job(
             booking_opens_at,
             cron_config,
             precheck,
+            specific_date=class_config.specific_date,
         )
     )
     return j
 
 
 def generate_booking_schedule(
-    opening_time: datetime, cron_config: Cron, precheck: bool
+    opening_time: datetime.datetime,
+    cron_config: Cron,
+    precheck: bool,
+    specific_date: datetime.date | None = None,
 ):
     # making sure date and time strings are in system timezone
     system_opening_time = opening_time.astimezone()
     if precheck:
-        precheck_time = system_opening_time - timedelta(
+        precheck_time = system_opening_time - datetime.timedelta(
             hours=cron_config.precheck_hours
         )
+        if specific_date is not None:
+            return (
+                precheck_time.minute,
+                precheck_time.hour,
+                precheck_time.day,
+                precheck_time.month,
+                "*",
+            )
         return (
             precheck_time.minute,
             precheck_time.hour,
@@ -162,9 +174,17 @@ def generate_booking_schedule(
             "*",
             (precheck_time.weekday() + 1) % 7,
         )
-    booking_time = system_opening_time - timedelta(
+    booking_time = system_opening_time - datetime.timedelta(
         minutes=cron_config.preparation_minutes
     )
+    if specific_date is not None:
+        return (
+            booking_time.minute,
+            booking_time.hour,
+            booking_time.day,
+            booking_time.month,
+            "*",
+        )
     return (
         booking_time.minute,
         booking_time.hour,
